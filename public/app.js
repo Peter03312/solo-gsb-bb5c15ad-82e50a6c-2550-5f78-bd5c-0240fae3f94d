@@ -189,8 +189,12 @@ async function loadExhibits() {
       // 列表接口未附加阈值时退化为只用 over/剩余额度着色
       const chips = years.map((y) => {
         const cls = y.over ? 'over' : y.remaining !== null && y.remaining < y.limit * 0.1 ? 'warn' : '';
+        // 有占用但无上限的年份显示“无上限”并如实带出真实占用（与详情同口径）
+        const value = y.limit === null
+          ? `无上限${y.used ? `（已用 ${fmtN(y.used)} lx·h）` : ''}`
+          : `${fmtN(y.remaining)} / ${fmtN(y.limit)} lx·h`;
         return `<div class="chip ${cls}"><span>${y.year} 年剩余</span>
-          <span class="mono">${y.limit === null ? '无上限' : `${fmtN(y.remaining)} / ${fmtN(y.limit)} lx·h`}</span></div>`;
+          <span class="mono">${value}</span></div>`;
       }).join('');
       const highAlerts = (e.quotaAlertHigh || 0);
       const lowAlerts = (e.quotaAlertLow || 0);

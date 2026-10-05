@@ -3907,6 +3907,153 @@ async function runFlow() {
       && batchMeasSrc.some((s) => s.lux === 180 && s.yearly['2034'] === 540),
       '批次生成的两条相接实测在占用来源中各自独立');
   }
+
+  // =======================================================================
+  // 展品列表按展品汇总：真实 PostgreSQL 的 BIGINT 主键以字符串返回，
+  // 列表必须用“数字 id”关联 annual_usage/annual_limits/annual_quota_thresholds，
+  // 与详情同口径（上限/已用/剩余/超额、低高档计数），且多展品/跨年不串号。
+  // =======================================================================
+  {
+    // 临时让展品查询与三张按展品汇总查询返回字符串 id/exhibit_id（等价于真实 pg 驱动行为），
+    // 列表处理器若混用字符串主键与数字索引，就会全部关联不上。
+    const origQuery = dbModule.pool.query;
+    const stringifyRowIds = (row) => {
+      if (row && row.id !== undefined && row.id !== null) {
+        return { ...row, id: String(row.id) };
+      }
+      return row;
+    };
+    dbModule.pool.query = async function (text, params) {
+      const result = await origQuery.call(this, text, params);
+      const sql = typeof text === 'string' ? text : text && text.text;
+      if (typeof sql === 'string' && /FROM exhibits ORDER BY id/.test(sql) && result.rows) {
+        return { ...result, rows: result.rows.map(stringifyRowIds) };
+      }
+      if (typeof sql === 'string' && /FROM annual_(usage|limits|quota_thresholds)/.test(sql)
+        && result.rows) {
+        return {
+          ...result,
+          rows: result.rows.map((row) => ({ ...row, exhibit_id: String(row.exhibit_id) })),
+        };
+      }
+      return result;
+    };
+
+    let listBody;
+    try {
+      const lA = await createExhibit('列表串号展品甲');
+      const lB = await createExhibit('列表串号展品乙');
+
+      // 甲：2040 上限 1000 + 阈值（低 50 / 高 80），批准计划占 800（高档），再把上限下调到 500（超额）；
+      //     2041 只配置阈值（无占用、无上限），不应进 years 也不计数；
+      //     2020 用计划外事故构造“有占用、无上限”。
+      await call('POST', `/api/exhibits/${lA}/limits`, { year: 2040, limitLxh: 1000 }, 'c');
+      await call('POST', `/api/exhibits/${lA}/quota-thresholds`,
+        { year: 2040, lowPct: 50, highPct: 80 }, 'c');
+      await call('POST', `/api/exhibits/${lA}/quota-thresholds`,
+        { year: 2041, lowPct: 50, highPct: 80 }, 'c');
+      const lpA = await submitPlan(lA, '列表甲2040计划', '2040-06-01', '2040-06-01',
+        ['09:00-17:00'], 100); // 800
+      await approvePlan(lpA);
+      // 上限下调到 500：占用 800，超额 300（旧接口路径，成功响应仍为详情）
+      let rr = await call('POST', `/api/exhibits/${lA}/limits`,
+        { year: 2040, limitLxh: 500 }, 'c');
+      assert(rr.status === 200 && rr.body.years['2040'].over === true
+        && rr.body.years['2040'].used === 800 && rr.body.years['2040'].limit === 500,
+        '列表甲 2040 下调后 500/800 超额');
+      // 有占用、无上限年份（事故 6h×100 = 600，无需上限即可入账）
+      rr = await call('POST', '/api/incidents', {
+        exhibitId: lA,
+        startDate: '2020-06-01', startTime: '09:00',
+        endDate: '2020-06-01', endTime: '15:00',
+        actualLux: 100, reason: '列表甲无上限年份占用',
+      }, 'c');
+      assert(rr.status === 201, '列表甲 2020 事故入账（无上限年份）');
+
+      // 乙：2040 上限 5000 + 阈值（低 50 / 高 80），计划占 3000（60%，低档，不高档），
+      //     数值刻意与甲不同以便发现串号；另给 2042 上限（占用 0）。
+      await call('POST', `/api/exhibits/${lB}/limits`, { year: 2040, limitLxh: 5000 }, 'c');
+      await call('POST', `/api/exhibits/${lB}/limits`, { year: 2042, limitLxh: 7000 }, 'c');
+      await call('POST', `/api/exhibits/${lB}/quota-thresholds`,
+        { year: 2040, lowPct: 50, highPct: 80 }, 'c');
+      const lpB = await submitPlan(lB, '列表乙2040计划',
+        '2040-07-01', '2040-07-03', ['09:00-17:00'], 125); // 3000
+      await approvePlan(lpB);
+
+      // 字符串 id 形态下取列表
+      const lr = await call('GET', '/api/exhibits', null, 'i');
+      assert(lr.status === 200, '列表 200');
+      listBody = lr.body;
+      const findInList = (id) => lr.body.exhibits.find((x) => Number(x.id) === id);
+      const itemA = findInList(lA);
+      const itemB = findInList(lB);
+      assert(itemA && itemB, '字符串主键下两件展品都能在列表中找到（关联修复）');
+
+      // —— 甲：上限/已用/剩余/超额与详情同口径 ——
+      assert(itemA.years['2040'].limit === 500 && itemA.years['2040'].used === 800
+        && itemA.years['2040'].remaining === -300 && itemA.years['2040'].over === true,
+        `列表甲 2040 与详情同口径（500/800/-300/over）：${JSON.stringify(itemA.years['2040'])}`);
+      // 有占用但无上限：显示“无上限”与真实占用，不超额
+      assert(itemA.years['2020'] && itemA.years['2020'].limit === null
+        && itemA.years['2020'].used === 600 && itemA.years['2020'].remaining === null
+        && itemA.years['2020'].over === false,
+        `列表甲 2020 无上限+真实占用：${JSON.stringify(itemA.years['2020'])}`);
+      // 仅阈值、无占用无上限：不进 years
+      assert(!itemA.years['2041'], '列表甲 2041 仅有阈值且无占用/上限，不进 years');
+      // 阈值计数按该年实际占用与阈值：高档 1（2040），低档 0；2041 无上限 none 不计数
+      assert(itemA.quotaAlertsConfigured === 2 && itemA.quotaAlertHigh === 1
+        && itemA.quotaAlertLow === 0,
+        `列表甲阈值计数（configured=2/high=1/low=0）：${JSON.stringify({
+          c: itemA.quotaAlertsConfigured, h: itemA.quotaAlertHigh, l: itemA.quotaAlertLow,
+        })}`);
+
+      // —— 乙：低档 1、高档 0；2042 零占用仍列出 ——
+      assert(itemB.years['2040'].limit === 5000 && itemB.years['2040'].used === 3000
+        && itemB.years['2040'].remaining === 2000 && itemB.years['2040'].over === false,
+        `列表乙 2040（5000/3000/2000/未超额）：${JSON.stringify(itemB.years['2040'])}`);
+      assert(itemB.years['2042'] && itemB.years['2042'].limit === 7000
+        && itemB.years['2042'].used === 0 && itemB.years['2042'].remaining === 7000,
+        `列表乙 2042 零占用年份列出：${JSON.stringify(itemB.years['2042'])}`);
+      assert(!itemB.years['2020'] && !itemB.years['2041'],
+        '列表乙不带入甲的年份（多展品不串号）');
+      assert(itemB.quotaAlertsConfigured === 1 && itemB.quotaAlertHigh === 0
+        && itemB.quotaAlertLow === 1,
+        `列表乙阈值计数（configured=1/high=0/low=1）：${JSON.stringify({
+          c: itemB.quotaAlertsConfigured, h: itemB.quotaAlertHigh, l: itemB.quotaAlertLow,
+        })}`);
+
+      // —— 与详情逐字段同口径（年份集合 + 每年四个字段）——
+      for (const [id, item] of [[lA, itemA], [lB, itemB]]) {
+        const dr = await call('GET', `/api/exhibits/${id}`, null, 'i');
+        assert(dr.status === 200, '详情 200');
+        const detailYears = dr.body.years;
+        const listYears = item.years;
+        assert(Object.keys(listYears).sort().join(',') === Object.keys(detailYears).sort().join(','),
+          `展品 #${id} 列表/详情年份集合一致（列表 ${Object.keys(listYears)} / 详情 ${Object.keys(detailYears)}）`);
+        for (const yr of Object.keys(detailYears)) {
+          for (const f of ['limit', 'used', 'remaining', 'over']) {
+            assert(listYears[yr][f] === detailYears[yr][f],
+              `展品 #${id} ${yr} 年 ${f} 列表=${listYears[yr][f]} 与详情=${detailYears[yr][f]} 同口径`);
+          }
+        }
+        // 阈值当前级别与详情 quotaThresholds 逐项一致
+        const detailLevels = Object.fromEntries(
+          dr.body.quotaThresholds.map((t) => [t.year, t.level]));
+        const byLevel = { none: 0, low: 0, high: 0 };
+        for (const lv of Object.values(detailLevels)) byLevel[lv] += 1;
+        assert(item.quotaAlertLow === byLevel.low && item.quotaAlertHigh === byLevel.high
+          && item.quotaAlertsConfigured === dr.body.quotaThresholds.length,
+          `展品 #${id} 列表低/高档计数与详情级别一致`);
+      }
+    } finally {
+      dbModule.pool.query = origQuery;
+    }
+
+    // 恢复数字 id（pg-mem 默认形态）后列表仍正常，且上面两件展品不串号
+    const rr2 = await call('GET', '/api/exhibits', null, 'i');
+    assert(rr2.status === 200 && rr2.body.exhibits.length === listBody.exhibits.length,
+      '恢复驱动后列表响应保持兼容');
+  }
 }
 
 main().catch((err) => {

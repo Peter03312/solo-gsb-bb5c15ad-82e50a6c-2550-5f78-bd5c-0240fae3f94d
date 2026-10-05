@@ -432,7 +432,7 @@ curl -b cookies.txt -X POST http://localhost:3000/api/auth/logout
 
 | 方法 & 路径 | 角色 | 说明 |
 | --- | --- | --- |
-| `GET  /api/exhibits` | 登录 | 展品列表 + 年度额度概况 |
+| `GET  /api/exhibits` | 登录 | 展品列表 + 年度额度概况（本轮修复，详见下节“展品列表年度概况口径”） |
 | `POST /api/exhibits` | 保管员 | 登记展品 |
 | `GET  /api/exhibits/:id` | 登录 | 展品详情：按年额度、占用来源（含 `kind:'incident'` 事故条目与 `kind:'sharedLighting'` 共享照明归属条目）、计划（计划行内联 `pendingAdjustment`）、实测、`blackouts` 停灯记录（逐条带 `yearly`）与 `blackoutDeductionYearly` 各年扣减汇总、`incidents` 计划外照明事故（逐条带 `yearly`/`yearlyInside`/`yearlyOutside`）与 `incidentDoseYearly` 各年事故实际用光汇总、`residences` 展厅驻留（附 `covered`）、`sharedLightings` 共享照明归属（逐条带 `yearly`/`yearlyInside`/`yearlyOutside`/`allocations`）与 `sharedLightingDoseYearly` 各年共享照明用光汇总、`ledgers` 已封存年度账册（每条附封存值与当前重算对照 `comparison`）、`quotaThresholds` 分级预警阈值（附当前占用/占比/级别）、`quotaAlerts` 预警触发历史与 `quotaAlertsUnread` 未读条数 |
 | `GET  /api/exhibits/:id/ledgers` | 登录 | 已封存年度账册列表；`?compare=1` 附按当前数据重算的对照差额 |
@@ -470,6 +470,27 @@ curl -b cookies.txt -X POST http://localhost:3000/api/auth/logout
 | `GET /api/shared-lightings?hallCode=&exhibitId=` | 登录 | **共享照明**列表（按归属展品逐条返回，附按年实际用光、窗内/窗外拆分与归属段） |
 | `POST /api/shared-lightings` | 保管员 | **登记一次展厅共享照明**；按驻留交集归属多展品、跨年拆分；冲突整次拒绝（409 `details.conflictsByExhibit`）；超限仍入账返回 **409**（各展品超额年份） |
 | `GET /api/audit` | 保管员 | 操作流水（含 `blackout.create`、`incident.create`、`plan.flag_review_incident`、`residence.create`、`shared_lighting.create`、`plan.flag_review_shared_lighting`） |
+
+#### 展品列表年度概况口径（本轮修复，仅列表行为）
+
+`GET /api/exhibits` 的既有响应字段与状态码不变；列表按展品/自然年汇总时改为与
+`GET /api/exhibits/:id` **完全同口径**，修复真实 PostgreSQL 下 BIGINT 主键以字符串返回、
+而列表用数字索引关联导致占用/上限/阈值全部关联不上的问题（表现为已有上限与占用仍显示
+“尚未登记年度额度”、已配置低/高档预警计数为 0）。
+
+- 关联键统一为数字展品 id：多件展品、跨年记录不会串号；
+- 每件展品的 `years` 为按自然年（字符串年份为键）的对象，每年含与详情同构的
+  `year` / `limit` / `used` / `remaining` / `over`，数值沿用统一 `round3` 舍入：
+  - 已登记上限的年份必列（占用为 0 也列）；
+  - **有占用但无上限**的年份照实列出：`limit=null`（前端显示“无上限”）、`used` 为真实占用、
+    `remaining=null`、`over=false`；
+  - 仅配置过阈值、占用为 0 且无上限的年份不进入 `years`（与详情一致）；
+- `quotaAlertsConfigured` 为该展品已配置阈值的年份数；`quotaAlertLow` / `quotaAlertHigh`
+  为**按该年实际占用与已配置阈值**统计的当前低/高档年份数（与详情 `quotaThresholds[].level`
+  一致）：未配置阈值的年份不产生任何计数，未登记上限的年份级别恒为 `none`（“无上限”，
+  不计入低/高档）。
+- 占用直接读派生表 `annual_usage`（由各变更事务按年局部维护），列表不逐展品重算全部历史；
+  字段仍仅为附加字段，列表、详情与展品登记的既有 HTTP 响应字段保持兼容。
 
 ### 维护接口（conservator）
 
