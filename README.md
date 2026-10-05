@@ -1582,6 +1582,59 @@ curl -b cookies-custodian.txt -X POST http://localhost:3000/api/quota-alerts/rea
 
 审计写入 `quota_threshold.create`（首次设置）与 `quota_threshold.update`（修改重建基线）。
 
+### 展品列表的年度概况与当前预警计数 `GET /api/exhibits`（本轮修正，仅明确既有附加字段的口径）
+
+展品列表逐展品附加 `years`（按自然年汇总的上限/占用/剩余/超额）与三个预警计数字段，
+数据直接取自派生占用表 `annual_usage`、`annual_limits`、`annual_quota_thresholds`，
+**不为列表逐展品重算全部历史**，与展品详情（`GET /api/exhibits/:id` 的 `years` /
+`quotaThresholds`）完全同口径（同一统一剂量口径与 `round3` 舍入、`over` 的 `0.005` 容差）。
+列表与详情的 HTTP 响应字段保持不变；本轮修正的是真实 PostgreSQL 下列表的展品关联：
+
+- 关联键统一为展品数字主键。`exhibit_id`/`id` 为 `BIGINT`，真实 pg 驱动默认以**字符串**返回
+  （如 `"3"`；内存测试驱动返回数字）。列表归集与回查一律先 `Number(...)` 归一，
+  因此**多件展品、跨自然年纪录不会串号**，已登记上限与占用的展品不再显示「尚未登记年度额度」，
+  已配置的低/高档阈值也不再误计为 0。
+- `years[<年>] = { year, limit, used, remaining, over }`：
+  - 已登记上限：`limit` 为上限，`used` 为该年实际占用，`remaining = limit - used`，
+    `over` 与详情同判定（`used - limit > 0.005`）；
+  - **有占用但未登记上限的年份**：`limit: null`（页面显示「无上限」）、`used` 为真实占用、
+    `remaining: null`、`over: false`；
+  - 仅登记上限、尚无占用的年份：`used: 0`。
+- `quotaAlertsConfigured`：该展品已配置阈值的自然年数；
+  `quotaAlertHigh` / `quotaAlertLow`：按**该年实际占用与已配置阈值**现算的当前高/低档年数
+  （级别口径同详情 `quotaThresholds[].level`：`pct = used / limit × 100`，高档优先）。
+  **未配置阈值的年份不产生任何计数**；无上限年份级别恒为 `none`，不计入低/高档。
+
+```bash
+# 登录用户查看展品列表（每件展品含 years 与当前低/高档计数）
+curl -b cookies.txt http://localhost:3000/api/exhibits
+```
+
+列表中两件展品跨年且口径不同的示例片段（注意 `id` 在真实 pg 上为字符串，不影响按展品归集）：
+
+```json
+{
+  "exhibits": [
+    {
+      "id": "1", "name": "列表联调展品甲",
+      "years": {
+        "2024": { "year": 2024, "limit": 2000, "used": 0, "remaining": 2000, "over": false },
+        "2025": { "year": 2025, "limit": 1000, "used": 600, "remaining": 400, "over": false },
+        "2026": { "year": 2026, "limit": null, "used": 300, "remaining": null, "over": false }
+      },
+      "quotaAlertsConfigured": 1, "quotaAlertLow": 1, "quotaAlertHigh": 0
+    },
+    {
+      "id": "2", "name": "列表联调展品乙",
+      "years": {
+        "2025": { "year": 2025, "limit": 500, "used": 450, "remaining": 50, "over": false }
+      },
+      "quotaAlertsConfigured": 1, "quotaAlertLow": 0, "quotaAlertHigh": 1
+    }
+  ]
+}
+```
+
 
 ```
 src/

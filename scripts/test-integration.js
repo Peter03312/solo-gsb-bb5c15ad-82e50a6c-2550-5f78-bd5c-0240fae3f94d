@@ -3907,6 +3907,134 @@ async function runFlow() {
       && batchMeasSrc.some((s) => s.lux === 180 && s.yearly['2034'] === 540),
       '批次生成的两条相接实测在占用来源中各自独立');
   }
+
+  // =======================================================================
+  // 展品列表在真实 PostgreSQL（BIGINT 主键以字符串返回）下的关联回归
+  // pg-mem 把 bigint 返回为 number，而真实 pg 驱动默认返回 string；
+  // 列表此前用数字索引 Map 回查字符串主键，导致全部错配：
+  // 已有上限/占用仍显示“尚未登记年度额度”、预警计数为 0。
+  // =======================================================================
+  {
+    // 让共享连接池的查询结果把 bigint 列（exhibit_id 等）按真实 pg 形态转为字符串。
+    const realQuery = dbModule.pool.query.bind(dbModule.pool);
+    const STRING_BIGINT_COLS = new Set(['id', 'exhibit_id']);
+    dbModule.pool.query = async (...args) => {
+      const res = await realQuery(...args);
+      if (res && Array.isArray(res.rows)) {
+        for (const row of res.rows) {
+          for (const col of Object.keys(row)) {
+            if (STRING_BIGINT_COLS.has(col) && typeof row[col] === 'number') {
+              row[col] = String(row[col]);
+            }
+          }
+        }
+      }
+      return res;
+    };
+
+    try {
+      // 两件展品 + 跨自然年，构造不同的上限/占用/阈值组合，验证不串号
+      const exS1 = await createExhibit('列表真实主键展品甲');
+      const exS2 = await createExhibit('列表真实主键展品乙');
+      // 甲：2025 有上限 1000 且事故占用 600（低档 50% / 高档 80% → low）
+      await call('POST', `/api/exhibits/${exS1}/limits`, { year: 2025, limitLxh: 1000 }, 'c');
+      await call('POST', `/api/exhibits/${exS1}/quota-thresholds`,
+        { year: 2025, lowPct: 50, highPct: 80 }, 'c');
+      let rr = await call('POST', '/api/incidents', {
+        exhibitId: exS1,
+        startDate: '2025-03-01', startTime: '09:00',
+        endDate: '2025-03-01', endTime: '15:00',
+        actualLux: 100, reason: '甲 2025 事故 600',
+      }, 'c');
+      assert(rr.status === 201, '甲：2025 事故入账 600');
+      // 甲：2026 有占用 300（事故）但不设上限——列表须显示“无上限”与真实占用、不预警
+      rr = await call('POST', '/api/incidents', {
+        exhibitId: exS1,
+        startDate: '2026-03-01', startTime: '09:00',
+        endDate: '2026-03-01', endTime: '12:00',
+        actualLux: 100, reason: '甲 2026 无上限事故 300',
+      }, 'c');
+      assert(rr.status === 201, '甲：2026 无上限事故入账 300');
+      // 甲：2024 仅登记上限 2000、占用 0
+      await call('POST', `/api/exhibits/${exS1}/limits`, { year: 2024, limitLxh: 2000 }, 'c');
+
+      // 乙：2025 上限 500、事故占用 450（90%，阈值 50/80 → high）
+      await call('POST', `/api/exhibits/${exS2}/limits`, { year: 2025, limitLxh: 500 }, 'c');
+      await call('POST', `/api/exhibits/${exS2}/quota-thresholds`,
+        { year: 2025, lowPct: 50, highPct: 80 }, 'c');
+      rr = await call('POST', '/api/incidents', {
+        exhibitId: exS2,
+        startDate: '2025-04-01', startTime: '09:00',
+        endDate: '2025-04-01', endTime: '13:30', // 4.5h × 100 = 450
+        actualLux: 100, reason: '乙 2025 事故 450',
+      }, 'c');
+      assert(rr.status === 201, '乙：2025 事故入账 450（90% 高档）');
+
+      rr = await call('GET', '/api/exhibits', null, 'i');
+      assert(rr.status === 200, '字符串主键下列表可正常返回');
+      const card1 = rr.body.exhibits.find((e) => Number(e.id) === exS1);
+      const card2 = rr.body.exhibits.find((e) => Number(e.id) === exS2);
+      assert(card1 && card2, '两件展品都出现在列表中');
+
+      // 甲各年与详情同口径（先直接取详情比对）
+      const detail1 = (await call('GET', `/api/exhibits/${exS1}`, null, 'i')).body;
+      for (const yk of ['2024', '2025', '2026']) {
+        const ly = card1.years[yk];
+        const dy = detail1.years[yk];
+        assert(ly && dy, `甲 ${yk} 年在列表与详情都存在`);
+        assert(ly.limit === dy.limit && ly.used === dy.used
+          && ly.remaining === dy.remaining && ly.over === dy.over,
+          `甲 ${yk} 列表与详情同口径：列表 ${JSON.stringify(ly)} / 详情 ${JSON.stringify(dy)}`);
+      }
+      assert(card1.years['2024'].limit === 2000 && card1.years['2024'].used === 0
+        && card1.years['2024'].remaining === 2000 && card1.years['2024'].over === false,
+        '甲 2024：上限 2000、占用 0、剩余 2000');
+      assert(card1.years['2025'].limit === 1000 && card1.years['2025'].used === 600
+        && card1.years['2025'].remaining === 400 && card1.years['2025'].over === false,
+        '甲 2025：上限 1000、占用 600、剩余 400');
+      assert(card1.years['2026'].limit === null && card1.years['2026'].used === 300
+        && card1.years['2026'].remaining === null && card1.years['2026'].over === false,
+        '甲 2026：有占用无上限显示“无上限”（limit=null）与真实占用 300');
+
+      // 不串号：乙 2025 必须是 500/450，而不是甲的 1000/600
+      assert(card2.years['2025'].limit === 500 && card2.years['2025'].used === 450
+        && card2.years['2025'].remaining === 50 && card2.years['2025'].over === false,
+        `乙 2025 与甲不串号（500/450/50）：${JSON.stringify(card2.years['2025'])}`);
+      assert(card2.years['2026'] === undefined, '乙没有 2026 年纪录（不被甲的年份污染）');
+
+      // 预警当前级别计数按该年实际占用与阈值统计
+      assert(card1.quotaAlertsConfigured === 1 && card1.quotaAlertLow === 1 && card1.quotaAlertHigh === 0,
+        `甲：1 组阈值、当前 low 1（2025 60%）、无 high：${JSON.stringify({
+          configured: card1.quotaAlertsConfigured, low: card1.quotaAlertLow, high: card1.quotaAlertHigh,
+        })}`);
+      assert(card2.quotaAlertsConfigured === 1 && card2.quotaAlertLow === 0 && card2.quotaAlertHigh === 1,
+        `乙：1 组阈值、当前 high 1（2025 90%）：${JSON.stringify({
+          configured: card2.quotaAlertsConfigured, low: card2.quotaAlertLow, high: card2.quotaAlertHigh,
+        })}`);
+
+      // 未配置阈值不产生预警计数：再建一件只有上限+占用、无阈值的展品
+      const exS3 = await createExhibit('列表真实主键展品丙');
+      await call('POST', `/api/exhibits/${exS3}/limits`, { year: 2025, limitLxh: 1000 }, 'c');
+      await call('POST', '/api/incidents', {
+        exhibitId: exS3,
+        startDate: '2025-05-01', startTime: '09:00',
+        endDate: '2025-05-01', endTime: '15:00',
+        actualLux: 100, reason: '丙 无阈值事故 600',
+      }, 'c');
+      rr = await call('GET', '/api/exhibits', null, 'i');
+      const card3 = rr.body.exhibits.find((e) => Number(e.id) === exS3);
+      assert(card3.years['2025'].limit === 1000 && card3.years['2025'].used === 600,
+        '丙：无阈值也正确关联上限与占用');
+      assert(card3.quotaAlertsConfigured === 0 && card3.quotaAlertLow === 0 && card3.quotaAlertHigh === 0,
+        '丙：未配置阈值不产生任何预警计数');
+    } finally {
+      dbModule.pool.query = realQuery;
+    }
+
+    // 恢复后列表仍正常（监控桩不泄漏到后续）
+    const rr = await call('GET', '/api/exhibits', null, 'i');
+    assert(rr.status === 200 && Array.isArray(rr.body.exhibits), '恢复 pool 后列表正常');
+  }
 }
 
 main().catch((err) => {

@@ -17,6 +17,7 @@ const {
 } = require('../ledger');
 const alerts = require('../alerts');
 const { recomputeExhibitUsage } = require('../usage');
+const { round3 } = require('../dosing');
 
 const router = express.Router();
 
@@ -248,10 +249,12 @@ async function applyLowerAndFlag(client, actor, exhibitId, year, previousLimit, 
 // 展品列表（带每展品年度额度概况 + 分级预警当前级别计数，仅附加字段）
 // 年度概况直接读取派生占用表 annual_usage（与详情同一口径，由各变更事务按年局部维护），
 // 不为列表逐展品重算全部历史。
+// 主键 exhibit_id 为 BIGINT：真实 pg 驱动按字符串返回（pg-mem 等内存驱动返回数字），
+// 故所有按展品归集与回查一律先 Number(...) 归一，多件展品/跨年纪录不得串号。
 router.get('/', async (req, res, next) => {
   try {
     const { rows } = await query('SELECT * FROM exhibits ORDER BY id');
-    const ids = rows.map((e) => e.id);
+    const ids = rows.map((e) => Number(e.id));
     const usageByExhibit = new Map();
     const limitsByExhibit = new Map();
     const thresholdsByExhibit = new Map();
@@ -262,14 +265,14 @@ router.get('/', async (req, res, next) => {
       for (const u of usageRows.rows) {
         const exId = Number(u.exhibit_id);
         if (!usageByExhibit.has(exId)) usageByExhibit.set(exId, {});
-        usageByExhibit.get(exId)[String(u.year)] = u;
+        usageByExhibit.get(exId)[String(Number(u.year))] = u;
       }
       const limitRows = await query(
         `SELECT exhibit_id, year, limit_lxh FROM annual_limits WHERE exhibit_id IN (${ph})`, ids);
       for (const l of limitRows.rows) {
         const exId = Number(l.exhibit_id);
         if (!limitsByExhibit.has(exId)) limitsByExhibit.set(exId, {});
-        limitsByExhibit.get(exId)[String(l.year)] = Number(l.limit_lxh);
+        limitsByExhibit.get(exId)[String(Number(l.year))] = Number(l.limit_lxh);
       }
       const thresholdRows = await query(
         `SELECT * FROM annual_quota_thresholds WHERE exhibit_id IN (${ph}) ORDER BY exhibit_id, year`,
@@ -283,26 +286,34 @@ router.get('/', async (req, res, next) => {
 
     const items = [];
     for (const e of rows) {
-      const usageByYear = usageByExhibit.get(e.id) || {};
-      const limitsByYear = limitsByExhibit.get(e.id) || {};
+      // e.id 在真实 pg 上是字符串（BIGINT），必须与归集 Map 一样归一为数字后回查，
+      // 否则多展品/跨年纪录会全部错配为空（列表显示“尚未登记年度额度”、预警计数为 0）。
+      const exId = Number(e.id);
+      const usageByYear = usageByExhibit.get(exId) || {};
+      const limitsByYear = limitsByExhibit.get(exId) || {};
       const years = {};
       const yearKeys = new Set(
         [...Object.keys(usageByYear), ...Object.keys(limitsByYear)].map(Number)
       );
       for (const year of [...yearKeys].sort((a, b) => a - b)) {
         const key = String(year);
-        const usedVal = usageByYear[key] ? Number(usageByYear[key].used_lxh) : 0;
-        const limitVal = limitsByYear[key] !== undefined ? Number(limitsByYear[key]) : null;
+        // 占用、上限、剩余、超额与详情 computeOccupancy 的 yearsReport 完全同口径
+        // （round3 + 0.005 超额判定）：有占用但无上限的年份 limit=null（“无上限”），
+        // used 显示真实占用、remaining=null、over=false。
+        const usedVal = usageByYear[key] ? round3(Number(usageByYear[key].used_lxh)) : 0;
+        const limitVal = limitsByYear[key] !== undefined ? round3(Number(limitsByYear[key])) : null;
         years[key] = {
           year,
           limit: limitVal,
           used: usedVal,
-          remaining: limitVal === null ? null : Math.round((limitVal - usedVal) * 1000) / 1000,
+          remaining: limitVal === null ? null : round3(limitVal - usedVal),
           over: limitVal === null ? false : usedVal - limitVal > 0.005,
         };
       }
+      // 当前低/高档数量按该年实际占用（annual_usage）与已配置阈值现算；
+      // 未配置阈值的年份不产生任何计数，无上限年份级别恒为 none。
       const thresholds = alerts.buildThresholdViewFromUsage(
-        thresholdsByExhibit.get(e.id) || [],
+        thresholdsByExhibit.get(exId) || [],
         { usageByYear, limitsByYear }
       );
       let quotaAlertHigh = 0;
